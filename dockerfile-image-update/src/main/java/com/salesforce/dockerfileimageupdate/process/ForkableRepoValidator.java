@@ -1,9 +1,12 @@
 package com.salesforce.dockerfileimageupdate.process;
 
-import com.salesforce.dockerfileimageupdate.model.FromInstruction;
 import com.salesforce.dockerfileimageupdate.model.GitForkBranch;
-import com.salesforce.dockerfileimageupdate.model.ImageKeyValuePair;
 import com.salesforce.dockerfileimageupdate.model.ShouldForkResult;
+import com.salesforce.dockerfileimageupdate.parser.DockerfileDocument;
+import com.salesforce.dockerfileimageupdate.parser.DockerfileParser;
+import com.salesforce.dockerfileimageupdate.parser.DockerfileRewriter;
+import com.salesforce.dockerfileimageupdate.parser.RewriteResult;
+import com.salesforce.dockerfileimageupdate.parser.UnsupportedDockerfileEncodingException;
 import com.salesforce.dockerfileimageupdate.utils.DockerfileGitHubUtil;
 import org.kohsuke.github.GHContent;
 import org.kohsuke.github.GHRepository;
@@ -96,19 +99,13 @@ public class ForkableRepoValidator {
      * @return {@code Boolean} value signifying whether there are any changes content
      */
     protected boolean hasNoChanges(GHContent content, GitForkBranch gitForkBranch) {
-        try (InputStream stream = content.read();
-             InputStreamReader streamR = new InputStreamReader(stream);
-             BufferedReader reader = new BufferedReader(streamR)) {
-            String line;
-            while ( (line = reader.readLine()) != null ) {
-                if (FromInstruction.isFromInstructionWithThisImageAndOlderTag(line,
-                        gitForkBranch.getImageName(), gitForkBranch.getImageTag()) ||
-                        ImageKeyValuePair.isImageKeyValuePairWithThisImageAndOlderTag(line,
-                        gitForkBranch.getImageName(), gitForkBranch.getImageTag())) {
-                    return false;
-                }
-            }
-        } catch (IOException | UnsupportedOperationException exception) {
+        try (InputStream stream = content.read()) {
+            DockerfileDocument document = DockerfileParser.parse(stream.readAllBytes());
+            RewriteResult result = DockerfileRewriter.rewrite(document,
+                    gitForkBranch.getImageName(), gitForkBranch.getImageTag(), null, true);
+            return !result.isModified();
+        } catch (IOException | UnsupportedOperationException
+                 | UnsupportedDockerfileEncodingException exception) {
             log.warn("Failed while checking if there are changes in {}. Skipping... exception: {}",
                     content.getPath(), exception.getMessage(), exception);
         }

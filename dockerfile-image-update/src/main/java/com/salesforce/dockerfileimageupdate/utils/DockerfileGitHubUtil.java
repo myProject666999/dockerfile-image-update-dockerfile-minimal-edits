@@ -10,6 +10,12 @@ package com.salesforce.dockerfileimageupdate.utils;
 
 import com.google.common.collect.Multimap;
 import com.salesforce.dockerfileimageupdate.model.*;
+import com.salesforce.dockerfileimageupdate.parser.Diagnostic;
+import com.salesforce.dockerfileimageupdate.parser.DockerfileDocument;
+import com.salesforce.dockerfileimageupdate.parser.DockerfileParser;
+import com.salesforce.dockerfileimageupdate.parser.DockerfileRewriter;
+import com.salesforce.dockerfileimageupdate.parser.RewriteResult;
+import com.salesforce.dockerfileimageupdate.parser.UnsupportedDockerfileEncodingException;
 import com.salesforce.dockerfileimageupdate.repository.GitHub;
 import com.salesforce.dockerfileimageupdate.search.GitHubImageSearchTermList;
 import com.salesforce.dockerfileimageupdate.storage.GitHubJsonStore;
@@ -286,12 +292,26 @@ public class DockerfileGitHubUtil {
     protected boolean modifyContentOnGithub(GHContent content,
                                   String branch, String img, String tag,
                                   String customMessage, String ignoreImageString) throws IOException {
-        try (InputStream stream = content.read();
-             InputStreamReader streamR = new InputStreamReader(stream);
-             BufferedReader reader = new BufferedReader(streamR)) {
-            return findImagesAndFix(content, branch, img, tag, customMessage, reader,
-                    ignoreImageString);
+        byte[] bytes;
+        try (InputStream stream = content.read()) {
+            bytes = stream.readAllBytes();
         }
+        String documentText;
+        try {
+            documentText = DockerfileParser.parse(bytes).getText();
+        } catch (UnsupportedDockerfileEncodingException e) {
+            log.warn("Skipping {}: {}", content.getPath(), e.getMessage());
+            return false;
+        }
+        // File discovery is unchanged, and every file it selects is still checked for both FROM
+        // instructions and docker-compose style "image:" keys, exactly as before.
+        RewriteResult result = rewriteDocument(documentText, img, tag, ignoreImageString, true);
+        if (!result.isModified()) {
+            return false;
+        }
+        content.update(result.getUpdatedText(),
+                "Fix Docker base image in /" + content.getPath() + "\n\n" + customMessage, branch);
+        return true;
     }
 
     protected boolean findImagesAndFix(GHContent content, String branch, String img,
@@ -306,66 +326,69 @@ public class DockerfileGitHubUtil {
         return modified;
     }
 
+    /**
+     * Reads the whole document and rewrites it with {@link DockerfileRewriter}. The document is
+     * buffered and joined with {@code \n} because the historic callers hand in a
+     * {@link BufferedReader}; byte-exact preservation of the original terminators is provided by
+     * {@link #rewriteDocument(String, String, String, String, boolean)} for callers that hold the
+     * file's bytes.
+     */
     protected boolean rewriteDockerfile(String img, String tag,
                                         BufferedReader reader, StringBuilder strB,
                                         String ignoreImageString) throws IOException {
+        StringBuilder contentBuilder = new StringBuilder();
         String line;
-        boolean modified = false;
-        while ( (line = reader.readLine()) != null ) {
-            if (ignorePRCommentPresent(line, ignoreImageString)) {
-                strB.append(line).append("\n");
-
-                // Skip the next Line so it is not processed for PR creation
-                line = reader.readLine();
-                strB.append(line).append("\n");
-                continue;
-            }
-            /* Once true, should stay true. */
-            modified = changeIfDockerfileBaseImageLine(img, tag, strB, line) || modified;
+        while ((line = reader.readLine()) != null) {
+            contentBuilder.append(line).append("\n");
         }
-        return modified;
+        String original = contentBuilder.toString();
+        // A reader may hold a Dockerfile or a compose file; check both, as this path always has.
+        RewriteResult result = rewriteDocument(original, img, tag, ignoreImageString, true);
+        strB.append(result.getUpdatedText());
+        return result.isModified();
     }
 
     /**
-     * This method will read a line and see if the line contains a FROM instruction(Dockerfile) or imageKeyValuePair instruction(docker-compose) with the specified
-     * {@code imageToFind}. If the image does not have the given {@code tag} then {@code stringBuilder}
-     * will get a modified version of the line with the new {@code tag}. We return {@code true} in this
-     * instance.
-     *
-     * If the inbound {@code line} does not qualify for changes or if the tag is already correct, the
-     * {@code stringBuilder} will get {@code line} added to it. We return {@code false} in this instance.
-     *
+     * Parses and rewrites a Dockerfile (and, when requested, docker-compose {@code image:} lines),
+     * editing only the bytes of the tag values that change. When nothing changes the returned
+     * text is identical to {@code documentText}, and diagnostics explain every skipped reference.
+     */
+    public RewriteResult rewriteDocument(String documentText, String img, String tag,
+                                         String ignoreImageString, boolean includeCompose) {
+        DockerfileDocument document = DockerfileParser.parseText(documentText);
+        for (Diagnostic diagnostic : document.getDiagnostics()) {
+            log.warn("Dockerfile parse note (line {}): {}", diagnostic.getLineNumber(), diagnostic.getMessage());
+        }
+        RewriteResult result = DockerfileRewriter.rewrite(document, img, tag, ignoreImageString, includeCompose);
+        for (Diagnostic diagnostic : result.getSkipped()) {
+            log.info("Not updating image reference (line {}): {}", diagnostic.getLineNumber(),
+                    diagnostic.getMessage());
+        }
+        return result;
+    }
+
+    /**
+     * Single-line entry point kept for callers that process a document one line at a time.
+     * Delegates to the same parser the bulk rewrite uses, so a line is interpreted identically in
+     * both paths: only the tag bytes change, and anything the parser cannot resolve is left as-is.
      *
      * @param imageToFind the Docker image that may require a tag update
      * @param tag the Docker tag that we'd like the image to have
      * @param stringBuilder the stringBuilder to accumulate the output lines for the pull request
-     * @param line the inbound line from the Dockerfile
-     * @return Whether we've modified the {@code line} that goes into {@code stringBuilder}
+     * @param line the inbound line from the Dockerfile or docker-compose file
+     * @return whether the line was modified
      */
     protected boolean changeIfDockerfileBaseImageLine(String imageToFind, String tag,
                                                       StringBuilder stringBuilder, String line) {
         boolean modified = false;
         String outputLine = line;
-
-        // Only check/modify lines which contain a FROM instruction or imageKeyValuePair instruction
-        if (FromInstruction.isFromInstruction(line)) {
-            FromInstruction fromInstruction = new FromInstruction(line);
-
-            if (fromInstruction.hasBaseImage(imageToFind) &&
-                    fromInstruction.hasADifferentTag(tag)) {
-                fromInstruction = fromInstruction.getFromInstructionWithNewTag(tag);
+        if (StringUtils.isNotBlank(line)) {
+            RewriteResult result = DockerfileRewriter.rewrite(
+                    DockerfileParser.parseText(line), imageToFind, tag, null, true);
+            if (result.isModified()) {
+                outputLine = result.getUpdatedText();
                 modified = true;
             }
-            outputLine = fromInstruction.toString();
-        } else if (ImageKeyValuePair.isImageKeyValuePair(line)) {
-            ImageKeyValuePair imageKeyValuePair = new ImageKeyValuePair(line);
-            if (imageKeyValuePair.hasBaseImage(imageToFind) &&
-                    imageKeyValuePair.hasADifferentTag(tag) &&
-                    DockerfileGitHubUtil.isValidImageTag(imageKeyValuePair.getTag())) {
-                imageKeyValuePair = imageKeyValuePair.getImageKeyValuePairWithNewTag(tag);
-                modified = true;
-            }
-            outputLine = imageKeyValuePair.toString();
         }
         stringBuilder.append(outputLine).append("\n");
         return modified;

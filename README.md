@@ -28,7 +28,8 @@ images they depend on get updated.
   * [Prerequisites](#prerequisites)
   * [Precautions](#precautions)
   * [How To Use It](#how-to-use-it)
-  * [Skip An Image](#additional-notes)
+  * [Skip An Image](#skip-an-image)
+  * [How `FROM` lines are parsed](#how-from-lines-are-parsed)
 * [Developer Guide](#developer-guide)
   * [Building](#building)
   * [Running locally](#running-locally)
@@ -216,6 +217,79 @@ Example:
 ```
 FROM imagename:imagetag # no-dfiu
 ```
+
+### How `FROM` lines are parsed
+
+The tool never reformats a Dockerfile. It parses the file, works out which bytes hold the tag it
+needs to change, and replaces exactly those bytes. Every other byte is copied through unchanged:
+`LF` versus `CRLF` (including files that mix the two), trailing spaces, comment indentation, the
+presence or absence of a final newline, and a UTF-8 byte-order mark. That means the diff in the
+pull request contains the tag change and nothing else.
+
+A `FROM` line is parsed into the image name, tag, digest, `--platform` value and stage alias.
+The tag is taken from the colon in the final path segment, so a private registry with a port
+(`registry.example.com:5000/team/image:1.2`) parses to name `registry.example.com:5000/team/image`
+and tag `1.2`.
+
+#### Variables
+
+`FROM` may reference build arguments. Three forms are supported:
+
+| Form | Example | What is updated |
+| --- | --- | --- |
+| `${NAME}` | `FROM image:${BASE_TAG}` | the `ARG` default, not the `FROM` line |
+| `$NAME` | `FROM image:$BASE_TAG` | the `ARG` default, not the `FROM` line |
+| `${NAME:-default}` | `FROM image:${BASE_TAG:-3.19}` | the inline default, on the `FROM` line |
+
+When the tag comes from an `ARG` declared before the first `FROM`, the tool edits that
+declaration's default value and leaves `FROM` as a variable reference, so a build-time
+`--build-arg` override keeps working. When the same argument is declared twice, the last
+declaration in scope wins and is the one that gets edited. If one `ARG` line declares more than
+one variable (`ARG A=1 B=2`), the line is rejected: that syntax belongs to a later Dockerfile
+version than this tool supports.
+
+Argument scope follows the Dockerfile reference. An `ARG` declared before the first `FROM` is
+visible to `FROM` lines only; inside a stage it must be re-declared, and a stage-level
+re-declaration shadows the global one from that point on.
+
+Other expansions (`${NAME-default}`, `${NAME:+alt}`, `${NAME:?err}`, nested expressions, or a
+variable concatenated with literal text such as `image:prefix-${TAG}`) are outside the supported
+subset. Lines using them are left untouched and reported.
+
+#### Multi-stage builds
+
+An alias declared with `FROM ... AS name` (the `AS` keyword is case-insensitive) can be used as
+the image of a later `FROM`. Such a reference points at the earlier stage, not at an external
+image, and is never updated. If an alias has the same name as a public image, the earlier stage
+wins, as the Dockerfile reference specifies. `FROM scratch` is the empty base image; it is never
+updated and is not reported as a missing image.
+
+#### Encodings and odd input
+
+A UTF-8 byte-order mark is preserved. UTF-16 files and input that is not valid UTF-8 are rejected
+with a warning and left untouched, rather than being silently transcoded. A parser directive that
+changes the escape character (`# escape=` followed by anything other than a backslash) is also
+refused, since honouring it would change how the rest of the file is read.
+
+#### Skip An Image
+
+The `no-dfiu` comment (see [Skip An Image](#skip-an-image)) may be a comment line immediately
+before the `FROM`, or a trailing comment on the same line.
+
+#### Compatibility with the previous line-matcher
+
+The previous implementation rewrote a line by splitting it and printing a normalised version. The
+structured parser is stricter, so a few inputs that used to be rewritten are now left alone:
+
+| Input | Before | Now |
+| --- | --- | --- |
+| `FROM image: 3` (space after the tag colon) | rewritten to `image:newtag` | skipped; `3` is a separate token, not part of the tag |
+| `image: image:   4` in a compose file | rewritten | skipped, same reason |
+| `FROM image   ` (trailing spaces on the `FROM` line) | rewritten, trailing spaces removed | rewritten in place, trailing spaces kept |
+| `FROM image:tag` followed by a tab and a comment | rewritten, tab normalised to one space | rewritten in place, the tab is kept |
+| `FROM image # no-dfiu` | not skipped (only a preceding comment line was honoured) | skipped |
+| `FROM $IMAGE:tag` (whole image from a variable) | rewritten by naive splitting | updated only when the variable has a resolvable default; otherwise skipped |
+| `FROM image:${UNSET}` | rewritten to `image:newtag`, destroying the variable | skipped; the variable is undeclared, so its value is unknown |
 
 ### PR throttling
 

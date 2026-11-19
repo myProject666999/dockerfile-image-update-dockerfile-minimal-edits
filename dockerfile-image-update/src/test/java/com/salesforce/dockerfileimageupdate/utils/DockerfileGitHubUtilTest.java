@@ -502,14 +502,19 @@ public class DockerfileGitHubUtilTest {
         assertEquals(strB.toString(), "hello\nFROM image:newtag\nthis is a test\n\n\n\nworld\n");
     }
 
+    /*
+     * Rewriting now edits only the tag bytes, so the spacing around a trailing comment and the
+     * original comment indentation are preserved instead of being normalised to a single space.
+     * See the README's "FROM parsing" section for the behaviour change.
+     */
     @DataProvider
     public Object[][] postTagData() {
         return new Object[][] {
                 { ":tag as builder", "newtag", "FROM image:newtag as builder"},
-                { ":tag#as builder", "newtag", "FROM image:newtag #as builder"},
+                { ":tag#as builder", "newtag", "FROM image:newtag#as builder"},
                 { ":tag # comment", "newtag", "FROM image:newtag # comment"},
-                { ":tag\t# comment", "newtag", "FROM image:newtag # comment"},
-                { ":tag\t# comment # # # ", "newtag", "FROM image:newtag # comment # # # "},
+                { ":tag\t# comment", "newtag", "FROM image:newtag\t# comment"},
+                { ":tag\t# comment # # # ", "newtag", "FROM image:newtag\t# comment # # # "},
                 { ":", "newtag", "FROM image:newtag"},
                 { ":test # :comment", "newtag", "FROM image:newtag # :comment"}
         };
@@ -570,13 +575,15 @@ public class DockerfileGitHubUtilTest {
                 {"image5", "246", "FROM image5_", false},
                 {"image6", "26", "FROM image7", false},
                 {"image8", "245", "FROM image8:245", false},
-                {"image8", "245", "FROM image8: 245", true},
+                // A space after the tag colon makes '245' a separate token; the strict parser
+                // refuses it (previously it trimmed and rewrote). See README compatibility notes.
+                {"image8", "245", "FROM image8: 245", false},
                 {"image3", "7", "FROM image3", true},
                 {"image3", "7", "  FROM image3", true},
                 {"image3", "7", "FROM image3  ",  true},
                 {"image3", "7", "\tFROM image3\t", true},
                 {"image7", "98", "FROM image7:4", true},
-                {"image7", "98", "FROM image7: 4", true},
+                {"image7", "98", "FROM image7: 4", false},
                 {"image124516418023_1085-1-1248571", "7357",
                         "FROM image124516418023_1085-1-1248571:18026809126359806124890356219518632048125", true},
                 {"image", "1234",
@@ -617,7 +624,7 @@ public class DockerfileGitHubUtilTest {
                 {"image3", "7", "image: image3  ",  false},
                 {"image3", "7", "\timage: image3\t", false},
                 {"image7", "98", "image: image7:4", true},
-                {"image7", "98", "image: image7:   4", true},
+                {"image7", "98", "image: image7:   4", false},
                 {"image124516418023_1085-1-1248571", "7357",
                         "image: image124516418023_1085-1-1248571:18026809126359806124890356219518632048125", true},
                 {"image", "1234",
@@ -1052,6 +1059,57 @@ public class DockerfileGitHubUtilTest {
         BufferedReader reader = new BufferedReader(new InputStreamReader(stream));
         dockerfileGitHubUtil.rewriteDockerfile(img, tag, reader, stringBuilder, ignoreImageString);
         assertEquals(stringBuilder.toString(), outputLines, "");
+    }
+
+    @DataProvider
+    public Object[][] byteExactFixtures() {
+        return new Object[][] {
+                {"crlf preserved", "FROM image:old\r\nRUN echo hi\r\n",
+                        "FROM image:new\r\nRUN echo hi\r\n"},
+                {"no trailing newline preserved", "FROM image:old",
+                        "FROM image:new"},
+                {"trailing spaces preserved", "FROM image:old   \nRUN echo hi  \n",
+                        "FROM image:new   \nRUN echo hi  \n"},
+                {"comment indentation preserved", "FROM image:old\t#   why   \n",
+                        "FROM image:new\t#   why   \n"},
+                {"no change means identical", "FROM other:old\r\n#   keep\r\n",
+                        "FROM other:old\r\n#   keep\r\n"},
+        };
+    }
+
+    @Test(dataProvider = "byteExactFixtures")
+    public void modifyContentOnGithubIsByteExact(String name, String input, String expected)
+            throws Exception {
+        gitHubUtil = mock(GitHubUtil.class);
+        dockerfileGitHubUtil = new DockerfileGitHubUtil(gitHubUtil);
+        GHContent content = mock(GHContent.class);
+        when(content.getPath()).thenReturn("Dockerfile");
+        when(content.read()).thenReturn(new ByteArrayInputStream(input.getBytes(StandardCharsets.UTF_8)));
+        ArgumentCaptor<String> updated = ArgumentCaptor.forClass(String.class);
+
+        boolean modified = dockerfileGitHubUtil.modifyContentOnGithub(content, "branch", "image", "new", "", "");
+
+        if (input.equals(expected)) {
+            assertFalse(modified, name);
+            verify(content, never()).update(anyString(), anyString(), anyString());
+        } else {
+            assertTrue(modified, name);
+            verify(content, times(1)).update(updated.capture(), anyString(), eq("branch"));
+            assertEquals(updated.getValue(), expected, name);
+        }
+    }
+
+    @Test
+    public void modifyContentOnGithubSkipsUtf16WithoutUpdating() throws Exception {
+        gitHubUtil = mock(GitHubUtil.class);
+        dockerfileGitHubUtil = new DockerfileGitHubUtil(gitHubUtil);
+        GHContent content = mock(GHContent.class);
+        when(content.getPath()).thenReturn("Dockerfile");
+        byte[] utf16 = "FROM image:old\n".getBytes(StandardCharsets.UTF_16LE);
+        when(content.read()).thenReturn(new ByteArrayInputStream(utf16));
+
+        assertFalse(dockerfileGitHubUtil.modifyContentOnGithub(content, "branch", "image", "new", "", ""));
+        verify(content, never()).update(anyString(), anyString(), anyString());
     }
 
     @DataProvider
